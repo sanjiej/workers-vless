@@ -3,16 +3,12 @@ import { connect } from 'cloudflare:sockets';
 const te = new TextEncoder();
 const td = new TextDecoder();
 
-// 支持从环境变量读取 UUID（推荐），或硬编码
-const UUID = '78888888-8888-4f73-8888-f2c15d3e332c';  // 可删除，优先用 env.UUID
-let EXPECTED_UUID_BYTES = null;
-
 export default {
 	async fetch(req, env) {
-		// 优先从环境变量取 UUID
-		const uuidStr = env.UUID || UUID;
+		// 支持环境变量 UUID，优先级最高；没有则用硬编码
+		const uuidStr = env.UUID || '78888888-8888-4f73-8888-f2c15d3e332c';
 		const clean = uuidStr.replace(/-/g, '');
-		EXPECTED_UUID_BYTES = Uint8Array.from(clean.match(/.{2}/g).map(byte => parseInt(byte, 16)));
+		const EXPECTED_UUID_BYTES = Uint8Array.from(clean.match(/.{2}/g).map(byte => parseInt(byte, 16)));
 
 		if (req.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
 			return new Response('OK', { status: 200 });
@@ -22,51 +18,56 @@ export default {
 		let pathname = url.pathname;
 		try { pathname = decodeURIComponent(pathname); } catch {}
 
-		// 宽松参数解析
-		let mode = 'd', proxyParam = null;
+		// 宽松参数解析，支持 /s=xxx 或 ?s=xxx 或任意位置
+		let mode = 'd';
+		let proxyParam = null;
 		const match = pathname.match(/[/?&]([sghp]|gh)=([^/&?#]+)/i);
 		if (match) {
 			const t = match[1].toLowerCase();
 			proxyParam = match[2];
-			mode = t === 'g' ? 'g' : t === 'gh' ? 'gh' : t;
+			if (t === 's') mode = 's';
+			else if (t === 'g') mode = 'g';
+			else if (t === 'p') mode = 'p';
+			else if (t === 'h') mode = 'h';
+			else if (t === 'gh') mode = 'gh';
 		}
 
-		const skJson = ['s','g','h','gh'].includes(mode) ? getSKJson(proxyParam) : null;
+		const skJson = ['s', 'g', 'h', 'gh'].includes(mode) ? parseProxyParam(proxyParam) : null;
 		const pParam = mode === 'p' ? proxyParam : null;
 
 		const [client, server] = Object.values(new WebSocketPair());
 		server.accept();
 
-		// early data
+		let remote = null;
+		let isDNS = false;
+		let versionByte = 0;
+
+		// 处理 early data
 		const early = req.headers.get('sec-websocket-protocol');
 		if (early) {
 			try {
-				server.send(Uint8Array.from(atob(early.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0)));
+				const bin = Uint8Array.from(atob(early.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+				server.send(bin);
 			} catch {}
 		}
 
-		let remote = null;
-		let isDNS = false;
-		let versionByte = 0;  // 记录客户端版本字节
-
 		new ReadableStream({
-			start(c) {
-				server.addEventListener('message', e => c.enqueue(e.data));
-				server.addEventListener('close', () => remote?.close?.());
-				server.addEventListener('error', () => remote?.close?.());
+			start(controller) {
+				server.addEventListener('message', e => controller.enqueue(e.data));
+				server.addEventListener('close', () => { remote?.close?.(); controller.close(); });
+				server.addEventListener('error', () => { remote?.close?.(); controller.error(); });
 			}
 		}).pipeTo(new WritableStream({
 			async write(chunk) {
 				if (isDNS) {
-					// DNS 逻辑略（保持原样）
 					if (chunk.byteLength < 2) return;
 					const len = new DataView(chunk).getUint16(0);
 					if (chunk.byteLength < 2 + len) return;
-					const query = chunk.slice(2);
+					const query = chunk.slice(2, 2 + len);
 					try {
-						const resp = await fetch('https://dns.cloudflare.com/dns-query', {  // 改用 Cloudflare DoH，更稳定
+						const resp = await fetch('https://1.1.1.1/dns-query', {
 							method: 'POST',
-							headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
+							headers: { 'content-type': 'application/dns-message' },
 							body: query
 						});
 						const data = new Uint8Array(await resp.arrayBuffer());
@@ -74,15 +75,18 @@ export default {
 						frame.set([versionByte, 0]);
 						frame.set(new Uint16Array([data.length]).buffer, 2);
 						frame.set(data, 4);
-						server.send(frame);
+						if (server.readyState === 1) server.send(frame);
 					} catch {}
 					return;
 				}
 
 				if (!remote) {
-					if (chunk.byteLength < 17 || !verifyUUID(chunk)) return server.close();
+					// UUID 验证
+					if (chunk.byteLength < 17) return server.close();
+					const uuidPart = new Uint8Array(chunk, 1, 16);
+					if (!EXPECTED_UUID_BYTES.every((b, i) => b === uuidPart[i])) return server.close();
 
-					versionByte = chunk[0];  // 记住版本
+					versionByte = chunk[0];
 
 					const view = new DataView(chunk.buffer, chunk.byteOffset);
 					const optLen = view.getUint8(17);
@@ -93,17 +97,16 @@ export default {
 					const port = view.getUint16(pos);
 					pos += 2;
 					const atyp = view.getUint8(pos++);
-
 					let addr = '';
+
 					if (atyp === 1) {
-						addr = [0,1,2,3].map(i => view.getUint8(pos + i)).join('.');
-						pos += 4;
+						addr = `${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}`;
 					} else if (atyp === 3) {
 						const len = view.getUint8(pos++);
 						addr = td.decode(chunk.slice(pos, pos + len));
 						pos += len;
 					} else {
-						return server.close();
+						return server.close(); // 不支持 IPv6 等
 					}
 
 					const payload = chunk.slice(pos);
@@ -124,31 +127,33 @@ export default {
 								remote = connect({ hostname: addr, port });
 								await remote.opened;
 							} else if (m === 's') {
-								remote = await sConnect(addr, port, skJson);
+								remote = await socks5Connect(addr, port, skJson);
 							} else if (m === 'p') {
 								const [h, p = port] = pParam.split(':');
 								remote = connect({ hostname: h, port: +p });
 								await remote.opened;
 							} else if (m === 'h') {
-								remote = await httpConnect(addr, port, skJson);
+								remote = await httpCONNECT(addr, port, skJson);
 							}
 							if (remote) break;
-						} catch {}
+						} catch (e) {
+							// 继续尝试下一个
+						}
 					}
 
 					if (!remote) return server.close();
 
-					// 关键修复：连接成功后立即发送确认头
-					server.send(new Uint8Array([versionByte, 0]));
+					// 关键：连接成功后立即发送确认头 [version, 0]
+					if (server.readyState === 1) server.send(new Uint8Array([versionByte, 0]));
 
-					// 转发初始 payload
+					// 转发客户端初始 payload
 					if (remote.writable) {
-						const w = remote.writable.getWriter();
-						await w.write(payload);
-						w.releaseLock();
+						const writer = remote.writable.getWriter();
+						await writer.write(payload);
+						writer.releaseLock();
 					}
 
-					// 双向转发
+					// 下行数据直接转发（不再加任何头）
 					remote.readable.pipeTo(new WritableStream({
 						write(data) {
 							if (server.readyState === 1) server.send(data);
@@ -159,11 +164,11 @@ export default {
 					return;
 				}
 
-				// 后续数据直接转发
+				// 后续数据直接转发到远程
 				if (remote.writable) {
-					const w = remote.writable.getWriter();
-					await w.write(chunk);
-					w.releaseLock();
+					const writer = remote.writable.getWriter();
+					await writer.write(chunk);
+					writer.releaseLock();
 				}
 			}
 		})).catch(() => {});
@@ -172,13 +177,82 @@ export default {
 	}
 };
 
-// getSKJson / sConnect / httpConnect 函数保持上次版本不变（已验证可靠）
-function getSKJson(str) { /* 同上 */ }
-async function sConnect(...) { /* 同上 */ }
-async function httpConnect(...) { /* 同上 */ }
+// 解析代理参数 user:pass@host:port
+function parseProxyParam(str) {
+	if (!str) return null;
+	const hasAuth = str.includes('@');
+	const [cred, server] = hasAuth ? str.split('@') : [null, str];
+	const [user, pass] = hasAuth ? cred.split(':') : [null, null];
+	const [host, port = 443] = server.split(':');
+	return { user, pass, host, port: Number(port) };
+}
 
-function verifyUUID(data) {
-	if (data.byteLength < 17) return false;
-	const uuidBytes = new Uint8Array(data.buffer, data.byteOffset + 1, 16);
-	return EXPECTED_UUID_BYTES.every((b, i) => b === uuidBytes[i]);
+// SOCKS5 代理连接
+async function socks5Connect(addr, port, proxy) {
+	const sock = connect({ hostname: proxy.host, port: proxy.port });
+	await sock.opened;
+
+	const writer = sock.writable.getWriter();
+	const reader = sock.readable.getReader();
+
+	await writer.write(new Uint8Array([5, 2, 0, 2])); // 支持无认证 + 用户名密码
+	const { value: authResp } = await reader.read();
+	const method = authResp[1];
+
+	if (method === 2 && proxy.user) {
+		const u = te.encode(proxy.user);
+		const p = te.encode(proxy.pass || '');
+		await writer.write(new Uint8Array([1, u.length, ...u, p.length, ...p]));
+		await reader.read();
+	}
+
+	const domain = te.encode(addr);
+	await writer.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, port >> 8, port & 0xff]));
+	await reader.read();
+
+	writer.releaseLock();
+	reader.releaseLock();
+	return sock;
+}
+
+// HTTP CONNECT 代理
+async function httpCONNECT(addr, port, proxy) {
+	const sock = connect({ hostname: proxy.host, port: proxy.port });
+	await sock.opened;
+
+	const auth = proxy.user ? `Basic ${btoa(`${proxy.user}:${proxy.pass || ''}`)}` : '';
+	const request = `CONNECT ${addr}:${port} HTTP/1.1\r\nHost: ${addr}:${port}\r\n${auth ? `Proxy-Authorization: ${auth}\r\n` : ''}\r\n\r\n`;
+
+	const writer = sock.writable.getWriter();
+	await writer.write(te.encode(request));
+	writer.releaseLock();
+
+	const reader = sock.readable.getReader();
+	let buffer = new Uint8Array(0);
+	let headerEnd = -1;
+
+	while (headerEnd === -1) {
+		const { value, done } = await reader.read();
+		if (done) throw new Error('Proxy closed early');
+		const tmp = new Uint8Array(buffer.length + value.length);
+		tmp.set(buffer);
+		tmp.set(value, buffer.length);
+		buffer = tmp;
+		const text = td.decode(buffer);
+		headerEnd = text.indexOf('\r\n\r\n');
+	}
+
+	if (!td.decode(buffer.slice(0, headerEnd + 4)).includes('200')) {
+		throw new Error('HTTP CONNECT failed');
+	}
+
+	const remaining = buffer.slice(headerEnd + 4);
+	const { readable: newReadable, writable: newWritable } = new TransformStream();
+	if (remaining.length > 0) {
+		new ReadableStream({ start(c) { c.enqueue(remaining); c.close(); } }).pipeTo(newWritable).catch(() => {});
+	}
+	sock.readable.pipeTo(newWritable).catch(() => {});
+
+	reader.releaseLock();
+	return { readable: newReadable, writable: sock.writable };
 }
