@@ -5,153 +5,166 @@ const td = new TextDecoder();
 
 export default {
   async fetch(request, env) {
-    // 支持环境变量 UUID，优先使用 env.UUID
+    // 支持环境变量 UUID，优先使用 env.UUID（强烈推荐设置）
     const uuidStr = env.UUID || '78888888-8888-4f73-8888-f2c15d3e332c';
-    const cleanUUID = uuidStr.replace(/-/g, '');
-    const EXPECTED_UUID = Uint8Array.from(cleanUUID.match(/.{2}/g).map(b => parseInt(b, 16)));
+    const clean = uuidStr.replace(/-/g, '');
+    const EXPECTED_UUID = Uint8Array.from(clean.match(/.{2}/g).map(b => parseInt(b, 16)));
 
-    const upgradeHeader = request.headers.get('Upgrade');
-    if (!upgradeHeader || upgradeHeader !== 'websocket') {
-      return new Response('OK', { status: 200 });
+    const upgrade = request.headers.get('Upgrade');
+    if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
+      return new Response('Hello World', { status: 200 });
     }
 
     const url = new URL(request.url);
     let path = url.pathname + url.search;
     try { path = decodeURIComponent(path); } catch {}
 
+    // 宽松解析模式参数
     let mode = 'd';
     let proxyParam = null;
-    const paramMatch = path.match(/[/?&]([sghp]|gh)=([^/&?#]+)/i);
-    if (paramMatch) {
-      const type = paramMatch[1].toLowerCase();
-      proxyParam = paramMatch[2];
-      mode = type === 'g' ? 'g' : type === 'gh' ? 'gh' : type;
+    const match = path.match(/[/?&]([sghp]|gh)=([^/&?#]+)/i);
+    if (match) {
+      const t = match[1].toLowerCase();
+      proxyParam = match[2];
+      mode = t === 'g' ? 'g' : t === 'gh' ? 'gh' : t;
     }
 
-    const proxyConfig = ['s','g','h','gh'].includes(mode) ? parseProxy(proxyParam) : null;
+    const proxyConfig = ['s', 'g', 'h', 'gh'].includes(mode) ? parseProxy(proxyParam) : null;
     const directProxy = mode === 'p' ? proxyParam : null;
 
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
 
-    let remoteSocket = null;
+    let remote = null;
     let isDNS = false;
-    let clientVersion = 0;
+    let versionByte = 0;
+    let headerSent = false;
 
-    // Early Data
-    const earlyDataHeader = request.headers.get('sec-websocket-protocol');
-    if (earlyDataHeader) {
+    // Early Data 支持
+    const earlyHeader = request.headers.get('sec-websocket-protocol');
+    if (earlyHeader) {
       try {
-        const earlyData = Uint8Array.from(atob(earlyDataHeader.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+        const earlyData = Uint8Array.from(atob(earlyHeader.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
         server.send(earlyData);
       } catch {}
     }
 
-    const readable = new ReadableStream({
+    new ReadableStream({
       start(controller) {
-        server.addEventListener('message', msg => controller.enqueue(msg.data));
-        server.addEventListener('close', () => controller.close());
-        server.addEventListener('error', () => controller.error());
+        server.addEventListener('message', e => controller.enqueue(e.data));
+        server.addEventListener('close', () => { remote?.close?.(); controller.close(); });
+        server.addEventListener('error', () => { remote?.close?.(); controller.error(); });
       }
     }).pipeTo(new WritableStream({
       async write(chunk) {
         if (isDNS) {
-          // DNS over UDP
-          const length = new DataView(chunk).getUint16(0);
-          const query = chunk.slice(2, 2 + length);
+          // DNS 处理（保持原逻辑但简化）
+          if (chunk.byteLength < 2) return;
+          const len = new DataView(chunk.buffer).getUint16(0);
+          if (chunk.byteLength < 2 + len) return;
+          const query = chunk.slice(2, 2 + len);
           try {
             const resp = await fetch('https://1.1.1.1/dns-query', {
               method: 'POST',
               headers: { 'content-type': 'application/dns-message' },
               body: query
             });
-            const answer = new Uint8Array(await resp.arrayBuffer());
-            const responseFrame = new Uint8Array(4 + answer.length);
-            responseFrame.set([clientVersion, 0]);
-            responseFrame.set(new Uint16Array([answer.length]).buffer, 2);
-            responseFrame.set(answer, 4);
-            server.send(responseFrame);
+            const data = new Uint8Array(await resp.arrayBuffer());
+            const frame = new Uint8Array(4 + data.length);
+            frame.set([versionByte, 0]);
+            frame.set(new Uint16Array([data.length]).buffer, 2);
+            frame.set(data, 4);
+            if (server.readyState === 1) server.send(frame);
           } catch {}
           return;
         }
 
-        if (!remoteSocket) {
-          // 第一包：验证 UUID
+        if (!remote) {
+          // UUID 验证
           if (chunk.byteLength < 17) return server.close();
-          const uuidView = new Uint8Array(chunk, 1, 16);
+          const uuidView = new Uint8Array(chunk.buffer, chunk.byteOffset + 1, 16);
           if (!EXPECTED_UUID.every((b, i) => b === uuidView[i])) return server.close();
 
-          clientVersion = chunk[0];
+          versionByte = chunk[0]; // 记录版本字节
 
-          const view = new DataView(chunk.buffer);
+          const view = new DataView(chunk.buffer, chunk.byteOffset);
           const optLen = view.getUint8(17);
-          const command = view.getUint8(18 + optLen);
+          const cmd = view.getUint8(18 + optLen);
+          if (cmd !== 1 && cmd !== 2) return server.close();
 
           let pos = 19 + optLen;
           const port = view.getUint16(pos);
           pos += 2;
           const atyp = view.getUint8(pos++);
-          let address = '';
-          let addrBytes = 0;
+          let addr = '';
+          let addrLen = 0;
 
           if (atyp === 1) { // IPv4
-            address = `${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}`;
-            addrBytes = 4;
+            addr = `${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}`;
+            addrLen = 4;
           } else if (atyp === 3) { // Domain
-            const domainLen = view.getUint8(pos++);
-            address = td.decode(new Uint8Array(chunk.buffer, chunk.byteOffset + pos, domainLen));
-            addrBytes = 1 + domainLen;
-            pos += domainLen;
+            const dlen = view.getUint8(pos++);
+            addr = td.decode(new Uint8Array(chunk.buffer, chunk.byteOffset + pos, dlen));
+            addrLen = 1 + dlen;
+            pos += dlen;
+          } else if (atyp === 4) { // IPv6（简单支持）
+            const ipv6 = [];
+            for (let i = 0; i < 8; i++) {
+              ipv6.push(view.getUint16(pos).toString(16));
+              pos += 2;
+            }
+            addr = ipv6.join(':');
+            addrLen = 16;
           } else {
             return server.close();
           }
 
           const payload = chunk.slice(pos);
 
-          if (command === 2) { // UDP
+          if (cmd === 2) {
             if (port !== 53) return server.close();
             isDNS = true;
             if (payload.byteLength) server.send(payload);
             return;
           }
 
-          // TCP 连接顺序
-          const tryOrder = mode === 'g' ? ['s'] :
-                           mode === 'gh' ? ['h'] :
-                           mode === 's' ? ['d', 's'] :
-                           mode === 'h' ? ['d', 'h'] :
-                           mode === 'p' ? ['d', 'p'] : ['d'];
+          // 连接顺序
+          const order = mode === 'g' ? ['s'] :
+                        mode === 'gh' ? ['h'] :
+                        mode === 's' ? ['d', 's'] :
+                        mode === 'h' ? ['d', 'h'] :
+                        mode === 'p' ? ['d', 'p'] : ['d'];
 
-          for (const type of tryOrder) {
+          for (const type of order) {
             try {
               if (type === 'd') {
-                remoteSocket = connect({ hostname: address, port });
-                await remoteSocket.opened;
-              } else if (type === 's' && proxyConfig) {
-                remoteSocket = await socks5Handshake(address, port, proxyConfig);
+                remote = connect({ hostname: addr, port });
+                await remote.opened;
+              } else if ((type === 's' || type === 'g') && proxyConfig) {
+                remote = await socks5Connect(addr, port, proxyConfig);
               } else if (type === 'p' && directProxy) {
-                const [host, p = port] = directProxy.split(':');
-                remoteSocket = connect({ hostname: host, port: Number(p) });
-                await remoteSocket.opened;
-              } else if (type === 'h' && proxyConfig) {
-                remoteSocket = await httpConnectTunnel(address, port, proxyConfig);
+                const [h, p = port] = directProxy.split(':');
+                remote = connect({ hostname: h, port: +p });
+                await remote.opened;
+              } else if ((type === 'h' || type === 'gh') && proxyConfig) {
+                remote = await httpConnectTunnel(addr, port, proxyConfig);
               }
-              if (remoteSocket) break;
-            } catch (e) {}
+              if (remote) break;
+            } catch {}
           }
 
-          if (!remoteSocket) return server.close();
+          if (!remote) return server.close();
 
-          // 立即发送 VLESS 响应头
-          server.send(new Uint8Array([clientVersion, 0]));
+          // 关键修复：立即发送响应头
+          if (server.readyState === 1) server.send(new Uint8Array([versionByte, 0]));
 
           // 转发初始 payload
-          const writer = remoteSocket.writable.getWriter();
-          if (payload.byteLength) await writer.write(payload);
-          writer.releaseLock();
+          const w = remote.writable.getWriter();
+          if (payload.byteLength) await w.write(payload);
+          w.releaseLock();
 
-          // 双向转发
-          remoteSocket.readable.pipeTo(new WritableStream({
+          // 下行直接转发（不再加头）
+          remote.readable.pipeTo(new WritableStream({
             write(data) {
               if (server.readyState === 1) server.send(data);
             },
@@ -162,9 +175,9 @@ export default {
         }
 
         // 后续数据直接转发
-        const writer = remoteSocket.writable.getWriter();
-        await writer.write(chunk);
-        writer.releaseLock();
+        const w = remote.writable.getWriter();
+        await w.write(chunk);
+        w.releaseLock();
       }
     })).catch(() => {});
 
@@ -172,16 +185,17 @@ export default {
   }
 };
 
+// 解析代理参数 user:pass@host:port
 function parseProxy(str) {
   if (!str) return null;
   const hasAuth = str.includes('@');
   const [auth, server] = hasAuth ? str.split('@') : [null, str];
-  const [user, pass] = auth ? auth.split(':') : [null, null];
+  const [user, pass] = hasAuth ? auth.split(':') : [null, null];
   const [host, port = 443] = server.split(':');
   return { user, pass, host, port: Number(port) };
 }
 
-async function socks5Handshake(targetAddr, targetPort, proxy) {
+async function socks5Connect(addr, port, proxy) {
   const sock = connect({ hostname: proxy.host, port: proxy.port });
   await sock.opened;
 
@@ -189,8 +203,8 @@ async function socks5Handshake(targetAddr, targetPort, proxy) {
   const r = sock.readable.getReader();
 
   await w.write(new Uint8Array([5, 2, 0, 2]));
-  const { value: authMethodResp } = await r.read();
-  const method = authMethodResp[1];
+  const { value: resp } = await r.read();
+  const method = resp[1];
 
   if (method === 2 && proxy.user) {
     const u = te.encode(proxy.user);
@@ -199,8 +213,8 @@ async function socks5Handshake(targetAddr, targetPort, proxy) {
     await r.read();
   }
 
-  const domain = te.encode(targetAddr);
-  await w.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, targetPort >> 8, targetPort & 0xff]));
+  const domain = te.encode(addr);
+  await w.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, port >> 8, port & 0xff]));
   await r.read();
 
   w.releaseLock();
@@ -208,15 +222,15 @@ async function socks5Handshake(targetAddr, targetPort, proxy) {
   return sock;
 }
 
-async function httpConnectTunnel(targetAddr, targetPort, proxy) {
+async function httpConnectTunnel(addr, port, proxy) {
   const sock = connect({ hostname: proxy.host, port: proxy.port });
   await sock.opened;
 
-  const authHeader = proxy.user ? `Basic ${btoa(`${proxy.user}:${proxy.pass || ''}`)}` : '';
-  const connectReq = `CONNECT ${targetAddr}:${targetPort} HTTP/1.1\r\nHost: ${targetAddr}:${targetPort}\r\n${authHeader ? `Proxy-Authorization: ${authHeader}\r\n` : ''}\r\n\r\n`;
+  const auth = proxy.user ? `Basic ${btoa(`${proxy.user}:${proxy.pass || ''}`)}` : '';
+  const req = `CONNECT ${addr}:${port} HTTP/1.1\r\nHost: ${addr}:${port}\r\n${auth ? `Proxy-Authorization: ${auth}\r\n` : ''}\r\n\r\n`;
 
   const w = sock.writable.getWriter();
-  await w.write(te.encode(connectReq));
+  await w.write(te.encode(req));
   w.releaseLock();
 
   const reader = sock.readable.getReader();
@@ -225,24 +239,23 @@ async function httpConnectTunnel(targetAddr, targetPort, proxy) {
 
   while (headerEnd === -1) {
     const { value, done } = await reader.read();
-    if (done) throw new Error('Proxy connection closed');
-    const newBuf = new Uint8Array(buffer.length + value.length);
-    newBuf.set(buffer);
-    newBuf.set(value, buffer.length);
-    buffer = newBuf;
+    if (done) throw new Error('Proxy closed');
+    const tmp = new Uint8Array(buffer.length + value.length);
+    tmp.set(buffer);
+    tmp.set(value, buffer.length);
+    buffer = tmp;
     headerEnd = td.decode(buffer).indexOf('\r\n\r\n');
   }
 
-  const headerText = td.decode(buffer.slice(0, headerEnd + 4));
-  if (!headerText.includes('200')) throw new Error('Proxy CONNECT failed');
+  if (!td.decode(buffer.slice(0, headerEnd + 4)).includes('200')) throw new Error('CONNECT failed');
 
   const remaining = buffer.slice(headerEnd + 4);
-  const { readable: newReadable, writable: newWritable } = new TransformStream();
+  const { readable: newR, writable: newW } = new TransformStream();
   if (remaining.length) {
-    new ReadableStream({ start(c) { c.enqueue(remaining); c.close(); } }).pipeTo(newWritable);
+    new ReadableStream({ start(c) { c.enqueue(remaining); c.close(); } }).pipeTo(newW);
   }
-  sock.readable.pipeTo(newWritable);
+  sock.readable.pipeTo(newW);
 
   reader.releaseLock();
-  return { readable: newReadable, writable: sock.writable };
+  return { readable: newR, writable: sock.writable };
 }
