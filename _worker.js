@@ -5,7 +5,7 @@ const td = new TextDecoder();
 
 export default {
 	async fetch(req, env) {
-		// 支持环境变量 UUID，没有则用硬编码
+		// 支持环境变量 UUID，强烈建议设置自己的
 		const uuidStr = env.UUID || '78888888-8888-4f73-8888-f2c15d3e332c';
 		const clean = uuidStr.replace(/-/g, '');
 		const EXPECTED_UUID_BYTES = Uint8Array.from(clean.match(/.{2}/g).map(byte => parseInt(byte, 16)));
@@ -15,10 +15,9 @@ export default {
 		}
 
 		const url = new URL(req.url);
-		let pathname = url.pathname;
+		let pathname = url.pathname + url.search;
 		try { pathname = decodeURIComponent(pathname); } catch {}
 
-		// 宽松参数解析
 		let mode = 'd';
 		let proxyParam = null;
 		const match = pathname.match(/[/?&]([sghp]|gh)=([^/&?#]+)/i);
@@ -57,7 +56,7 @@ export default {
 			async write(chunk) {
 				if (isDNS) {
 					if (chunk.byteLength < 2) return;
-					const len = new DataView(chunk).getUint16(0);
+					const len = new DataView(chunk.buffer).getUint16(0);
 					if (chunk.byteLength < 2 + len) return;
 					const query = chunk.slice(2, 2 + len);
 					try {
@@ -77,10 +76,9 @@ export default {
 				}
 
 				if (!remote) {
-					// UUID 验证
 					if (chunk.byteLength < 17) return server.close();
-					const uuidPart = new Uint8Array(chunk, 1, 16);
-					if (!EXPECTED_UUID_BYTES.every((b, i) => b === uuidPart[i])) return server.close();
+					const uuidView = new Uint8Array(chunk, 1, 16);
+					if (!EXPECTED_UUID_BYTES.every((b, i) => b === uuidView[i])) return server.close();
 
 					versionByte = chunk[0];
 
@@ -94,17 +92,20 @@ export default {
 					pos += 2;
 					const atyp = view.getUint8(pos++);
 					let addr = '';
+					let addrLen = 0;
 
-					if (atyp === 1) {
-						addr = `${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}`;
-					} else if (atyp === 3) {
+					if (atyp === 1) { // IPv4
+						addr = `${view.getUint8(pos)}.${view.getUint8(pos+1)}.${view.getUint8(pos+2)}.${view.getUint8(pos+3)}`;
+						addrLen = 4;
+					} else if (atyp === 3) { // Domain
 						const len = view.getUint8(pos++);
-						addr = td.decode(chunk.slice(pos, pos + len));
+						addr = td.decode(new Uint8Array(chunk.buffer, chunk.byteOffset + pos, len));
+						addrLen = 1 + len;
 					} else {
 						return server.close();
 					}
 
-					const payload = chunk.slice(pos + (atyp === 1 ? 4 : view.getUint8(pos - 1)));
+					const payload = chunk.slice(pos + addrLen);
 
 					if (cmd === 2) {
 						if (port !== 53) return server.close();
@@ -113,7 +114,7 @@ export default {
 						return;
 					}
 
-					// 修复：正确定义连接顺序
+					// 连接顺序
 					let orders = ['d'];
 					if (mode === 'g') orders = ['s'];
 					else if (mode === 'gh') orders = ['h'];
@@ -136,24 +137,22 @@ export default {
 								remote = await httpCONNECT(addr, port, skJson);
 							}
 							if (remote) break;
-						} catch (e) {
-							// 继续下一个
-						}
+						} catch {}
 					}
 
 					if (!remote) return server.close();
 
-					// 立即发送确认头
+					// 立即发送 VLESS 确认头
 					if (server.readyState === 1) server.send(new Uint8Array([versionByte, 0]));
 
-					// 转发初始 payload
+					// 转发初始数据
 					if (remote.writable) {
-						const writer = remote.writable.getWriter();
-						await writer.write(payload);
-						writer.releaseLock();
+						const w = remote.writable.getWriter();
+						await w.write(payload);
+						w.releaseLock();
 					}
 
-					// 下行转发
+					// 下行直接转发
 					remote.readable.pipeTo(new WritableStream({
 						write(data) {
 							if (server.readyState === 1) server.send(data);
@@ -164,11 +163,11 @@ export default {
 					return;
 				}
 
-				// 后续数据转发
+				// 后续流量转发
 				if (remote.writable) {
-					const writer = remote.writable.getWriter();
-					await writer.write(chunk);
-					writer.releaseLock();
+					const w = remote.writable.getWriter();
+					await w.write(chunk);
+					w.releaseLock();
 				}
 			}
 		})).catch(() => {});
@@ -190,26 +189,26 @@ async function socks5Connect(addr, port, proxy) {
 	const sock = connect({ hostname: proxy.host, port: proxy.port });
 	await sock.opened;
 
-	const writer = sock.writable.getWriter();
-	const reader = sock.readable.getReader();
+	const w = sock.writable.getWriter();
+	const r = sock.readable.getReader();
 
-	await writer.write(new Uint8Array([5, 2, 0, 2]));
-	const { value: authResp } = await reader.read();
-	const method = authResp[1];
+	await w.write(new Uint8Array([5, 2, 0, 2]));
+	const { value: resp } = await r.read();
+	const method = resp[1];
 
 	if (method === 2 && proxy.user) {
 		const u = te.encode(proxy.user);
 		const p = te.encode(proxy.pass || '');
-		await writer.write(new Uint8Array([1, u.length, ...u, p.length, ...p]));
-		await reader.read();
+		await w.write(new Uint8Array([1, u.length, ...u, p.length, ...p]));
+		await r.read();
 	}
 
 	const domain = te.encode(addr);
-	await writer.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, port >> 8, port & 0xff]));
-	await reader.read();
+	await w.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, port >> 8, port & 0xff]));
+	await r.read();
 
-	writer.releaseLock();
-	reader.releaseLock();
+	w.releaseLock();
+	r.releaseLock();
 	return sock;
 }
 
@@ -220,9 +219,9 @@ async function httpCONNECT(addr, port, proxy) {
 	const auth = proxy.user ? `Basic ${btoa(`${proxy.user}:${proxy.pass || ''}`)}` : '';
 	const request = `CONNECT ${addr}:${port} HTTP/1.1\r\nHost: ${addr}:${port}\r\n${auth ? `Proxy-Authorization: ${auth}\r\n` : ''}\r\n\r\n`;
 
-	const writer = sock.writable.getWriter();
-	await writer.write(te.encode(request));
-	writer.releaseLock();
+	const w = sock.writable.getWriter();
+	await w.write(te.encode(request));
+	w.releaseLock();
 
 	const reader = sock.readable.getReader();
 	let buffer = new Uint8Array(0);
@@ -230,26 +229,23 @@ async function httpCONNECT(addr, port, proxy) {
 
 	while (headerEnd === -1) {
 		const { value, done } = await reader.read();
-		if (done) throw new Error('Proxy closed early');
+		if (done) throw 'proxy closed';
 		const tmp = new Uint8Array(buffer.length + value.length);
 		tmp.set(buffer);
 		tmp.set(value, buffer.length);
 		buffer = tmp;
-		const text = td.decode(buffer);
-		headerEnd = text.indexOf('\r\n\r\n');
+		headerEnd = td.decode(buffer).indexOf('\r\n\r\n');
 	}
 
-	if (!td.decode(buffer.slice(0, headerEnd + 4)).includes('200')) {
-		throw new Error('HTTP CONNECT failed');
-	}
+	if (!td.decode(buffer.slice(0, headerEnd + 4)).includes('200')) throw 'connect failed';
 
 	const remaining = buffer.slice(headerEnd + 4);
-	const { readable: newReadable, writable: newWritable } = new TransformStream();
-	if (remaining.length > 0) {
-		new ReadableStream({ start(c) { c.enqueue(remaining); c.close(); } }).pipeTo(newWritable).catch(() => {});
+	const { readable: newR, writable: newW } = new TransformStream();
+	if (remaining.length) {
+		new ReadableStream({ start(c) { c.enqueue(remaining); c.close(); } }).pipeTo(newW);
 	}
-	sock.readable.pipeTo(newWritable).catch(() => {});
+	sock.readable.pipeTo(newW);
 
 	reader.releaseLock();
-	return { readable: newReadable, writable: sock.writable };
+	return { readable: newR, writable: sock.writable };
 }
