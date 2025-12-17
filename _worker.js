@@ -13,339 +13,238 @@ function verifyUUID(data) {
 }
 
 const SK_CACHE = new Map();
-const orderCache = {
-	'p': ['d', 'p'],
-	's': ['d', 's'],
-	'g': ['s'],
-	'h': ['d', 'h'],
-	'gh': ['h'],
-	default: ['d']
-};
 
-function getSKJson(path) {
-	const cached = SK_CACHE.get(path);
+function getSKJson(str) {
+	if (!str) return null;
+	const cached = SK_CACHE.get(str);
 	if (cached) return cached;
 
-	const hasAuth = path.includes('@');
-	const [cred, server] = hasAuth ? path.split('@') : [null, path];
-	const [user = null, pass = null] = hasAuth ? cred.split(':') : [null, null];
-	const [host, port = 443] = (server || '').split(':');
+	const hasAuth = str.includes('@');
+	const [cred, server] = hasAuth ? str.split('@') : [null, str];
+	const [user, pass] = hasAuth ? cred.split(':') : [null, null];
+	const [host, port = 443] = server.split(':');
 
-	const result = { user, pass, host, port: +port || 443 };
-	SK_CACHE.set(path, result);
+	const result = { user, pass, host, port: Number(port) };
+	SK_CACHE.set(str, result);
 	return result;
 }
 
-function getOrder(mode) {
-	return orderCache[mode] || orderCache.default;
-}
-
-// 分片发送，避免 Cloudflare WebSocket 单包限制
-function sendFragmented(ws, data, isFirst = false) {
-	const header = new Uint8Array([data[0], 0]);
-	const maxSize = 16384; // 16KB 安全值
-
-	if (isFirst && data.byteLength <= maxSize) {
-		const combined = new Uint8Array(header.length + data.byteLength);
-		combined.set(header);
-		combined.set(new Uint8Array(data), header.length);
-		ws.send(combined);
-		return;
-	}
-
-	let offset = 0;
-	if (isFirst) {
-		const firstPart = data.slice(0, maxSize - header.length);
-		const combined = new Uint8Array(header.length + firstPart.byteLength);
-		combined.set(header);
-		combined.set(new Uint8Array(firstPart), header.length);
-		ws.send(combined);
-		offset = firstPart.byteLength;
-	}
-
-	while (offset < data.byteLength) {
-		const end = Math.min(offset + maxSize, data.byteLength);
-		ws.send(data.slice(offset, end));
-		offset = end;
-	}
-}
-
-async function sConnect(targetHost, targetPort, skJson) {
+async function sConnect(addr, port, skJson) {
 	const sock = connect({ hostname: skJson.host, port: skJson.port });
 	await sock.opened;
 
-	const w = sock.writable.getWriter();
-	const r = sock.readable.getReader();
+	const writer = sock.writable.getWriter();
+	const reader = sock.readable.getReader();
 
-	// SOCKS5 问候
-	await w.write(new Uint8Array([5, 2, 0, 2])); // 支持无认证和用户名密码
-	const { value: authResp } = await r.read();
-	if (!authResp || authResp.byteLength < 2) throw new Error('SOCKS5 auth failed');
+	await writer.write(new Uint8Array([5, 2, 0, 2]));
+	const { value: resp } = await reader.read();
+	const method = resp[1];
 
-	const authMethod = authResp[1];
-	if (authMethod === 2 && skJson.user) {
-		const user = te.encode(skJson.user);
-		const pass = te.encode(skJson.pass || '');
-		await w.write(new Uint8Array([1, user.length, ...user, pass.length, ...pass]));
-		await r.read(); // 忽略认证响应
-	} else if (authMethod !== 0) {
-		throw new Error('SOCKS5 no acceptable auth');
+	if (method === 2 && skJson.user) {
+		const u = te.encode(skJson.user);
+		const p = te.encode(skJson.pass || '');
+		await writer.write(new Uint8Array([1, u.length, ...u, p.length, ...p]));
+		await reader.read();
 	}
 
-	// 请求连接
-	const domain = te.encode(targetHost);
-	await w.write(new Uint8Array([
-		5, 1, 0, 3, domain.length, ...domain,
-		targetPort >> 8, targetPort & 0xff
-	]));
-	await r.read(); // 忽略响应
+	const domain = te.encode(addr);
+	await writer.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, port >> 8, port & 0xff]));
+	await reader.read();
 
-	w.releaseLock();
-	r.releaseLock();
+	writer.releaseLock();
+	reader.releaseLock();
 	return sock;
 }
 
-async function httpConnect(address, port, skJson) {
-	const { host, port: proxyPort, user, pass } = skJson;
-	const sock = connect({ hostname: host, port: proxyPort });
+async function httpConnect(addr, port, skJson) {
+	const sock = connect({ hostname: skJson.host, port: skJson.port });
 	await sock.opened;
 
-	const request = [
-		`CONNECT ${address}:${port} HTTP/1.1`,
-		`Host: ${address}:${port}`,
-		'Proxy-Connection: Keep-Alive',
-		'Connection: Keep-Alive',
-		user ? `Proxy-Authorization: Basic ${btoa(`${user}:${pass || ''}`)}` : null,
-		'', ''
-	].filter(Boolean).join('\r\n');
+	const auth = skJson.user ? `Basic ${btoa(`${skJson.user}:${skJson.pass || ''}`)}` : '';
+	const request = `CONNECT ${addr}:${port} HTTP/1.1\r\nHost: ${addr}:${port}\r\n${auth ? `Proxy-Authorization: ${auth}\r\n` : ''}\r\n\r\n`;
 
 	const writer = sock.writable.getWriter();
 	await writer.write(te.encode(request));
 	writer.releaseLock();
 
-	// 读取响应直到 \r\n\r\n
 	const reader = sock.readable.getReader();
 	let buffer = new Uint8Array(0);
 	let headerEnd = -1;
 
 	while (headerEnd === -1) {
 		const { value, done } = await reader.read();
-		if (done) throw new Error('HTTP proxy closed during headers');
+		if (done) throw new Error('Proxy closed');
 
-		const newBuf = new Uint8Array(buffer.length + value.length);
-		newBuf.set(buffer);
-		newBuf.set(value, buffer.length);
-		buffer = newBuf;
+		const tmp = new Uint8Array(buffer.length + value.length);
+		tmp.set(buffer); tmp.set(value, buffer.length);
+		buffer = tmp;
 
 		const text = td.decode(buffer);
 		headerEnd = text.indexOf('\r\n\r\n');
 	}
 
-	const headersText = td.decode(buffer.slice(0, headerEnd + 4));
-	if (!/^HTTP\/1\.[01] 2\d{2}/.test(headersText.split('\r\n')[0])) {
-		throw new Error('HTTP proxy connect failed: ' + headersText.split('\r\n')[0]);
+	if (!td.decode(buffer.slice(0, headerEnd + 4)).includes('200')) {
+		throw new Error('HTTP CONNECT failed');
 	}
 
-	// 剩余数据作为 readable 的起始
 	const remaining = buffer.slice(headerEnd + 4);
-	const { readable, writable } = new TransformStream();
-	if (remaining.length > 0) {
-		const enqueueRemaining = new WritableStream({
-			write() { },
-			start(controller) {
-				controller.enqueue(remaining);
-				controller.close();
-			}
-		});
-		new ReadableStream({ start(c) { c.enqueue(remaining); c.close(); } })
-			.pipeTo(writable).catch(() => {});
+	const { readable: newReadable, writable: newWritable } = new TransformStream();
+	if (remaining.length) {
+		new ReadableStream({ start(c) { c.enqueue(remaining); c.close(); } }).pipeTo(newWritable).catch(() => {});
 	}
+	sock.readable.pipeTo(newWritable).catch(() => {});
 
-	sock.readable.pipeTo(writable).catch(() => {});
 	reader.releaseLock();
-
-	return { readable, writable: sock.writable };
+	return { readable: newReadable, writable: sock.writable };
 }
 
 export default {
-	async fetch(req, env) {
+	async fetch(req) {
 		if (req.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
-			return new Response('Hello World', { status: 200 });
+			return new Response('OK', { status: 200 });
 		}
 
 		const url = new URL(req.url);
-		let mode = 'd';
-		let skJson = null;
-		let pParam = null;
+		let pathname = url.pathname;
+		try { pathname = decodeURIComponent(pathname); } catch {}
 
-		// 处理被编码的路径如 /%3Fs=user:pass@host:port
-		if (url.pathname.includes('%')) {
-			try {
-				const decoded = decodeURIComponent(url.pathname);
-				const qIndex = decoded.indexOf('?');
-				if (qIndex !== -1) {
-					url.pathname = decoded.slice(0, qIndex);
-					url.search = decoded.slice(qIndex);
-				} else {
-					url.pathname = decoded;
-				}
-			} catch {}
+		// 宽松解析参数
+		let mode = 'd', proxyParam = null;
+		const match = pathname.match(/[/?&]([sghp]|gh)=([^/&?]+)/i);
+		if (match) {
+			const type = match[1].toLowerCase();
+			proxyParam = match[2];
+			if (type === 's') mode = 's';
+			else if (type === 'g') mode = 'g';
+			else if (type === 'p') mode = 'p';
+			else if (type === 'h') mode = 'h';
+			else if (type === 'gh') mode = 'gh';
 		}
 
-		if (url.pathname.startsWith('/s=')) {
-			mode = 's'; skJson = getSKJson(url.pathname.slice(3));
-		} else if (url.pathname.startsWith('/g=')) {
-			mode = 'g'; skJson = getSKJson(url.pathname.slice(3));
-		} else if (url.pathname.startsWith('/p=')) {
-			mode = 'p'; pParam = url.pathname.slice(3);
-		} else if (url.pathname.startsWith('/h=')) {
-			mode = 'h'; skJson = getSKJson(url.pathname.slice(3));
-		} else if (url.pathname.startsWith('/gh=')) {
-			mode = 'gh'; skJson = getSKJson(url.pathname.slice(4));
-		}
+		const skJson = ['s','g','h','gh'].includes(mode) ? getSKJson(proxyParam) : null;
+		const pParam = mode === 'p' ? proxyParam : null;
 
 		const [client, server] = Object.values(new WebSocketPair());
 		server.accept();
 
 		let remote = null;
 		let isDNS = false;
-		let sentHeader = false;
+		let headerSent = false;
 
-		// 处理 early data
-		const earlyData = req.headers.get('sec-websocket-protocol');
-		if (earlyData) {
-			try {
-				const bin = Uint8Array.from(atob(earlyData.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-				server.send(bin);
-			} catch {}
+		// early data
+		const early = req.headers.get('sec-websocket-protocol');
+		if (early) {
+			try { server.send(Uint8Array.from(atob(early.replace(/-/g,'+').replace(/_/g,'/')), c=>c.charCodeAt(0))); } catch {}
 		}
 
 		new ReadableStream({
-			start(controller) {
-				server.addEventListener('message', e => {
-					if (e.data instanceof ArrayBuffer || e.data.buffer instanceof ArrayBuffer) {
-						controller.enqueue(e.data);
-					}
-				});
-				server.addEventListener('close', () => { remote?.close(); controller.close(); });
-				server.addEventListener('error', () => { remote?.close(); controller.error(); });
+			start(c) {
+				server.addEventListener('message', e => c.enqueue(e.data));
+				server.addEventListener('close', () => c.close());
+				server.addEventListener('error', () => c.error());
 			}
 		}).pipeTo(new WritableStream({
 			async write(chunk) {
 				if (isDNS) {
-					// DNS 逻辑保持原样
-					const len = new DataView(chunk.buffer, chunk.byteOffset, 2).getUint16(0);
+					// DNS 处理保持不变
+					const len = new DataView(chunk).getUint16(0);
 					const query = chunk.slice(2, 2 + len);
 					try {
-						const resp = await fetch('https://1.1.1.1/dns-query', {
-							method: 'POST',
-							headers: { 'content-type': 'application/dns-message' },
-							body: query
-						});
-						const result = new Uint8Array(await resp.arrayBuffer());
-						const header = new Uint8Array([chunk[0], 0]);
-						const frame = new Uint8Array(header.length + 2 + result.length);
-						frame.set(header);
-						frame.set(new Uint8Array(new Uint16Array([result.length]).buffer), header.length);
-						frame.set(result, header.length + 2);
-						if (server.readyState === 1) server.send(frame);
+						const resp = await fetch('https://1.1.1.1/dns-query', { method: 'POST', headers: { 'content-type': 'application/dns-message' }, body: query });
+						const data = new Uint8Array(await resp.arrayBuffer());
+						const frame = new Uint8Array(2 + data.length + 2);
+						frame.set([chunk[0], 0]);
+						frame.set(new Uint16Array([data.length]).buffer, 2);
+						frame.set(data, 4);
+						server.send(frame);
 					} catch {}
 					return;
 				}
 
 				if (!remote) {
-					if (chunk.byteLength < 24 || !verifyUUID(chunk)) {
-						server.close();
-						return;
-					}
+					if (chunk.byteLength < 24 || !verifyUUID(chunk)) return server.close();
 
 					const view = new DataView(chunk);
 					const optLen = view.getUint8(17);
 					const cmd = view.getUint8(18 + optLen);
-					if (cmd !== 1 && cmd !== 2) { server.close(); return; }
+					if (cmd !== 1 && cmd !== 2) return server.close();
 
 					let pos = 19 + optLen;
 					const port = view.getUint16(pos);
-					const type = view.getUint8(pos + 2);
-					pos += 3;
+					pos += 2;
+					const atyp = view.getUint8(pos++);
 
 					let addr = '';
-					if (type === 1) { // IPv4
-						addr = Array.from(new Uint8Array(chunk, pos, 4)).join('.');
-						pos += 4;
-					} else if (type === 2) { // Domain
+					if (atyp === 1) {
+						addr = `${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}.${view.getUint8(pos++)}`;
+					} else if (atyp === 3) {
 						const len = view.getUint8(pos++);
-						addr = td.decode(new Uint8Array(chunk, pos, len));
-						pos += len;
-					} else if (type === 3) { // IPv6 - 暂不常见，跳过
-						server.close();
-						return;
-					} else {
-						server.close();
-						return;
-					}
+						addr = td.decode(chunk.slice(pos, pos + len));
+					} else if (atyp === 4) {
+						// 简单 IPv6 支持（字符串形式）
+						addr = [...new Uint8Array(chunk, pos, 16)].map(b => b.toString(16).padStart(2,'0')).reduce((a,b,i) => a + (i%2? b : b+':'), '').replace(/:0+/g, ':');
+						pos += 16;
+					} else return server.close();
 
 					const payload = chunk.slice(pos);
 
-					if (cmd === 2) { // UDP DNS
-						if (port !== 53) { server.close(); return; }
+					if (cmd === 2) {
+						if (port !== 53) return server.close();
 						isDNS = true;
-						return server.send(payload); // 直接转发第一个查询
-					}
-
-					// TCP 连接尝试
-					for (const method of getOrder(mode)) {
-						try {
-							if (method === 'd') {
-								remote = connect({ hostname: addr, port });
-								await remote.opened;
-								break;
-							} else if ((method === 's' || method === 'g') && skJson) {
-								remote = await sConnect(addr, port, skJson);
-								break;
-							} else if (method === 'p' && pParam) {
-								const [ph, pp = port] = pParam.split(':');
-								remote = connect({ hostname: ph, port: +pp });
-								await remote.opened;
-								break;
-							} else if ((method === 'h' || method === 'gh') && skJson) {
-								const { readable, writable } = await httpConnect(addr, port, skJson);
-								remote = { readable, writable };
-								break;
-							}
-						} catch (e) {
-							continue;
-						}
-					}
-
-					if (!remote) {
-						server.close();
+						if (payload.byteLength) server.send(payload);
 						return;
 					}
 
-					// 转发初始 payload
-					const w = remote.writable.getWriter();
-					await w.write(payload);
-					w.releaseLock();
+					// 尝试连接顺序
+					const orders = mode === 'g' || mode === 'gh' ? [mode] : 
+								   mode === 'p' ? ['d', 'p'] : 
+								   mode === 's' || mode === 'h' ? ['d', mode] : ['d'];
 
-					// 双向转发（无控速）
-					remote.readable.pipeTo(new WritableStream({
-						write(chunk) {
-							if (server.readyState !== 1) return;
-							if (typeof chunk === 'object') { // ArrayBuffer
-								sendFragmented(server, chunk, !sentHeader);
-								sentHeader = true;
+					for (const m of orders) {
+						try {
+							if (m === 'd') {
+								remote = connect({ hostname: addr, port });
+								await Promise.race([remote.opened, new Promise((_, rej) => setTimeout(() => rej('timeout'), 5000))]);
+							} else if (m === 's' || m === 'g') {
+								remote = await sConnect(addr, port, skJson);
+							} else if (m === 'p') {
+								const [h, p = port] = pParam.split(':');
+								remote = connect({ hostname: h, port: +p });
+								await remote.opened;
+							} else if (m === 'h' || m === 'gh') {
+								remote = await httpConnect(addr, port, skJson);
 							}
-						},
-						close() { server.close(); },
-						abort() { server.close(); }
+							if (remote) break;
+						} catch {}
+					}
+
+					if (!remote) return server.close();
+
+					if (remote.writable) {
+						const w = remote.writable.getWriter();
+						await w.write(payload);
+						w.releaseLock();
+					}
+
+					remote.readable.pipeTo(new WritableStream({
+						write(data) {
+							if (server.readyState !== 1) return;
+							if (!headerSent) {
+								const header = new Uint8Array([chunk[0], 0]);
+								const combined = new Uint8Array(header.length + data.byteLength);
+								combined.set(header); combined.set(data, header.length);
+								server.send(combined);
+								headerSent = true;
+							} else {
+								server.send(data);
+							}
+						}
 					})).catch(() => server.close());
 
 					return;
 				}
 
-				// 已建立连接，继续转发
-				if (remote?.writable) {
+				if (remote.writable) {
 					const w = remote.writable.getWriter();
 					await w.write(chunk);
 					w.releaseLock();
