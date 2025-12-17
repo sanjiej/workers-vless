@@ -5,7 +5,7 @@ const td = new TextDecoder();
 
 export default {
 	async fetch(req, env) {
-		// 支持环境变量 UUID，优先级最高；没有则用硬编码
+		// 支持环境变量 UUID，没有则用硬编码
 		const uuidStr = env.UUID || '78888888-8888-4f73-8888-f2c15d3e332c';
 		const clean = uuidStr.replace(/-/g, '');
 		const EXPECTED_UUID_BYTES = Uint8Array.from(clean.match(/.{2}/g).map(byte => parseInt(byte, 16)));
@@ -18,18 +18,14 @@ export default {
 		let pathname = url.pathname;
 		try { pathname = decodeURIComponent(pathname); } catch {}
 
-		// 宽松参数解析，支持 /s=xxx 或 ?s=xxx 或任意位置
+		// 宽松参数解析
 		let mode = 'd';
 		let proxyParam = null;
 		const match = pathname.match(/[/?&]([sghp]|gh)=([^/&?#]+)/i);
 		if (match) {
 			const t = match[1].toLowerCase();
 			proxyParam = match[2];
-			if (t === 's') mode = 's';
-			else if (t === 'g') mode = 'g';
-			else if (t === 'p') mode = 'p';
-			else if (t === 'h') mode = 'h';
-			else if (t === 'gh') mode = 'gh';
+			mode = t === 'g' ? 'g' : t === 'gh' ? 'gh' : t;
 		}
 
 		const skJson = ['s', 'g', 'h', 'gh'].includes(mode) ? parseProxyParam(proxyParam) : null;
@@ -42,7 +38,7 @@ export default {
 		let isDNS = false;
 		let versionByte = 0;
 
-		// 处理 early data
+		// early data
 		const early = req.headers.get('sec-websocket-protocol');
 		if (early) {
 			try {
@@ -104,12 +100,11 @@ export default {
 					} else if (atyp === 3) {
 						const len = view.getUint8(pos++);
 						addr = td.decode(chunk.slice(pos, pos + len));
-						pos += len;
 					} else {
-						return server.close(); // 不支持 IPv6 等
+						return server.close();
 					}
 
-					const payload = chunk.slice(pos);
+					const payload = chunk.slice(pos + (atyp === 1 ? 4 : view.getUint8(pos - 1)));
 
 					if (cmd === 2) {
 						if (port !== 53) return server.close();
@@ -118,8 +113,13 @@ export default {
 						return;
 					}
 
-					// 连接顺序
-					const orders = mode === 'g' ? ['s'] : mode === 'gh' ? ['h'] : ['d', mode === 's' ? 's' : mode === 'h' ? 'h' : mode === 'p' ? 'p' : 'd'];
+					// 修复：正确定义连接顺序
+					let orders = ['d'];
+					if (mode === 'g') orders = ['s'];
+					else if (mode === 'gh') orders = ['h'];
+					else if (mode === 's') orders = ['d', 's'];
+					else if (mode === 'h') orders = ['d', 'h'];
+					else if (mode === 'p') orders = ['d', 'p'];
 
 					for (const m of orders) {
 						try {
@@ -137,23 +137,23 @@ export default {
 							}
 							if (remote) break;
 						} catch (e) {
-							// 继续尝试下一个
+							// 继续下一个
 						}
 					}
 
 					if (!remote) return server.close();
 
-					// 关键：连接成功后立即发送确认头 [version, 0]
+					// 立即发送确认头
 					if (server.readyState === 1) server.send(new Uint8Array([versionByte, 0]));
 
-					// 转发客户端初始 payload
+					// 转发初始 payload
 					if (remote.writable) {
 						const writer = remote.writable.getWriter();
 						await writer.write(payload);
 						writer.releaseLock();
 					}
 
-					// 下行数据直接转发（不再加任何头）
+					// 下行转发
 					remote.readable.pipeTo(new WritableStream({
 						write(data) {
 							if (server.readyState === 1) server.send(data);
@@ -164,7 +164,7 @@ export default {
 					return;
 				}
 
-				// 后续数据直接转发到远程
+				// 后续数据转发
 				if (remote.writable) {
 					const writer = remote.writable.getWriter();
 					await writer.write(chunk);
@@ -177,7 +177,6 @@ export default {
 	}
 };
 
-// 解析代理参数 user:pass@host:port
 function parseProxyParam(str) {
 	if (!str) return null;
 	const hasAuth = str.includes('@');
@@ -187,7 +186,6 @@ function parseProxyParam(str) {
 	return { user, pass, host, port: Number(port) };
 }
 
-// SOCKS5 代理连接
 async function socks5Connect(addr, port, proxy) {
 	const sock = connect({ hostname: proxy.host, port: proxy.port });
 	await sock.opened;
@@ -195,7 +193,7 @@ async function socks5Connect(addr, port, proxy) {
 	const writer = sock.writable.getWriter();
 	const reader = sock.readable.getReader();
 
-	await writer.write(new Uint8Array([5, 2, 0, 2])); // 支持无认证 + 用户名密码
+	await writer.write(new Uint8Array([5, 2, 0, 2]));
 	const { value: authResp } = await reader.read();
 	const method = authResp[1];
 
@@ -215,7 +213,6 @@ async function socks5Connect(addr, port, proxy) {
 	return sock;
 }
 
-// HTTP CONNECT 代理
 async function httpCONNECT(addr, port, proxy) {
 	const sock = connect({ hostname: proxy.host, port: proxy.port });
 	await sock.opened;
